@@ -2,7 +2,7 @@
 # This file contains our implementation of Magical Drop.
 #
 # Student 1: Saanvi Tyagi, 1011935541
-# Student 2: Name, Student Number (if applicable)
+# Student 2: Mahi Shah, 1011900187
 #
 # We assert that the code submitted here is entirely our own 
 # creation, and will indicate otherwise when it is not.
@@ -37,7 +37,7 @@ white:  .word 0xFFFFFF
 palette: .word 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00   # red, green, blue, yellow
 
 # ---------------- Game variables (change these while playing) ----------------
-fill_rows:   .word 6          # how many rows of bricks are filled from the top (max 14)
+fill_rows:   .word 4          # how many rows of bricks are filled from the top (max 14)
 aim_x:       .word 5          # x column of the character and aiming line (centre of box)
 held_colour: .word 0          # colour the character is holding (set at startup)
 next_colour: .word 0          # colour that will be held next (set at startup)
@@ -65,8 +65,12 @@ score_digits: .byte 1,3,5,0,0
 player_col:  .word 3          # grid column 0-6
 held_count:  .word 0
 key_count:   .word 0          # keys since the last new row
+score:       .word 0          # current score (shown in the PTS counter)
+time_left:   .word 60         # seconds remaining (shown in the LEFT counter)
+last_time:   .word 0          # ms timestamp of the last timer tick
 grid:        .space 392       # 14 x 7 cells, 4 bytes each, 0 = empty
 game_over_msg: .asciiz "Game over!\n"
+timeup_msg:    .asciiz "Time's up!\n"
 
 ##############################################################################
 # Code
@@ -325,6 +329,12 @@ text:
 
     jal fill_grid
 
+    # ---------------- Start the countdown timer ----------------
+    li   $v0, 30              # syscall 30 = system time in ms (low word in $a0)
+    syscall
+    sw   $a0, last_time       # start counting down from now
+    jal  draw_time            # show the initial time (60)
+
 game_loop:
     lw   $t0, ADDR_KBRD
     lw   $t1, 0($t0)
@@ -334,6 +344,7 @@ game_loop:
     beq  $t2, 0x61, key_left      # a
     beq  $t2, 0x64, key_right     # d
     beq  $t2, 0x73, key_grab      # s
+    beq  $t2, 0x77, key_throw     # w
     j    redraw
 
 key_left:
@@ -352,6 +363,10 @@ key_right:
 
 key_grab:
     jal  grab
+    j    count_key
+
+key_throw:
+    jal  throw
 
 count_key:
     lw   $t3, key_count
@@ -362,6 +377,7 @@ count_key:
     jal  advance_row
 
 redraw:
+    jal  update_timer             # tick the countdown once per real second
     jal  draw_field
     jal  draw_player
     li   $v0, 32                  # sleep 16 ms (~60 fps)
@@ -756,4 +772,230 @@ ar_done:
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     addi $sp, $sp, 12
+    jr   $ra
+
+##############################################################################
+# MILESTONE 3
+##############################################################################
+
+# throw: stack held bubbles under the lowest bubble in player_col, then check matches
+throw:
+    addi $sp, $sp, -20
+    sw   $ra, 0($sp)
+    sw   $s0, 4($sp)
+    sw   $s1, 8($sp)
+    sw   $s2, 12($sp)
+    sw   $s3, 16($sp)
+    lw   $t0, held_count
+    beqz $t0, th_done            # nothing held
+    lw   $s1, player_col
+    li   $s0, 13
+th_find:
+    blt  $s0, 0, th_place        # empty column: s0 = -1
+    move $a0, $s0
+    move $a1, $s1
+    jal  grid_addr
+    lw   $t1, 0($v0)
+    bne  $t1, 0, th_place        # found the lowest bubble
+    addi $s0, $s0, -1
+    j    th_find
+th_place:
+    addi $s0, $s0, 1             # first free row below the stack
+    lw   $s2, held_colour
+    lw   $s3, held_count
+th_loop:
+    beqz $s3, th_end
+    bgt  $s0, 13, th_end         # no room left in the column
+    move $a0, $s0
+    move $a1, $s1
+    jal  grid_addr
+    sw   $s2, 0($v0)
+    addi $s0, $s0, 1
+    addi $s3, $s3, -1
+    j    th_loop
+th_end:
+    sw   $zero, held_count
+    move $a0, $s1
+    jal  resolve_column          # delete matches (and chains)
+th_done:
+    lw   $ra, 0($sp)
+    lw   $s0, 4($sp)
+    lw   $s1, 8($sp)
+    lw   $s2, 12($sp)
+    lw   $s3, 16($sp)
+    addi $sp, $sp, 20
+    jr   $ra
+
+# resolve_column: $a0 = col. Delete vertical runs of 3+ (score = length * 2),
+# pull the bubbles below back up, and repeat while new matches form (chain reaction).
+resolve_column:
+    addi $sp, $sp, -24
+    sw   $ra, 0($sp)
+    sw   $s0, 4($sp)
+    sw   $s1, 8($sp)
+    sw   $s2, 12($sp)
+    sw   $s3, 16($sp)
+    sw   $s4, 20($sp)
+    move $s1, $a0                # column
+rc_pass:
+    li   $s4, 0                  # removed-something flag
+    li   $s0, 0                  # i = current row
+rc_scan:
+    bge  $s0, 14, rc_scan_done
+    move $a0, $s0
+    move $a1, $s1
+    jal  grid_addr
+    lw   $s2, 0($v0)             # colour at row i
+    bne  $s2, $zero, rc_run
+    addi $s0, $s0, 1
+    j    rc_scan
+rc_run:
+    addi $s3, $s0, 1             # j = end of run (exclusive)
+rc_ext:
+    bge  $s3, 14, rc_end
+    move $a0, $s3
+    move $a1, $s1
+    jal  grid_addr
+    lw   $t1, 0($v0)
+    bne  $t1, $s2, rc_end
+    addi $s3, $s3, 1
+    j    rc_ext
+rc_end:
+    sub  $t2, $s3, $s0           # run length
+    blt  $t2, 3, rc_next
+    sll  $a0, $t2, 1             # points = length * 2
+    jal  add_score
+    li   $s4, 1
+rc_clear:
+    bge  $s0, $s3, rc_next
+    move $a0, $s0
+    move $a1, $s1
+    jal  grid_addr
+    sw   $zero, 0($v0)
+    addi $s0, $s0, 1
+    j    rc_clear
+rc_next:
+    move $s0, $s3                # continue after this run
+    j    rc_scan
+rc_scan_done:
+    beqz $s4, rc_finish          # nothing removed: finished
+    li   $s0, 0                  # read row
+    li   $s3, 0                  # write row: compact bubbles up to the top
+rc_comp:
+    bge  $s0, 14, rc_pass        # compacted: rescan for chain matches
+    move $a0, $s0
+    move $a1, $s1
+    jal  grid_addr
+    lw   $t1, 0($v0)
+    beqz $t1, rc_comp_next
+    sw   $zero, 0($v0)
+    move $a0, $s3
+    move $a1, $s1
+    jal  grid_addr               # only changes $t0, so $t1 is safe
+    sw   $t1, 0($v0)
+    addi $s3, $s3, 1
+rc_comp_next:
+    addi $s0, $s0, 1
+    j    rc_comp
+rc_finish:
+    lw   $ra, 0($sp)
+    lw   $s0, 4($sp)
+    lw   $s1, 8($sp)
+    lw   $s2, 12($sp)
+    lw   $s3, 16($sp)
+    lw   $s4, 20($sp)
+    addi $sp, $sp, 24
+    jr   $ra
+
+# add_score: $a0 = points. Updates score, splits it into 5 digits, redraws it.
+add_score:
+    addi $sp, $sp, -8
+    sw   $ra, 0($sp)
+    sw   $s5, 4($sp)
+    lw   $t0, score
+    add  $t0, $t0, $a0
+    ble  $t0, 99999, as_ok
+    li   $t0, 99999              # cap at 5 digits
+as_ok:
+    sw   $t0, score
+    la   $t2, score_digits
+    addi $t2, $t2, 4             # start at the last (ones) digit
+    li   $t3, 10
+    li   $t4, 5
+as_digit:
+    div  $t0, $t3
+    mfhi $t5
+    mflo $t0
+    sb   $t5, 0($t2)
+    addi $t2, $t2, -1
+    addi $t4, $t4, -1
+    bgtz $t4, as_digit
+    lw   $s5, white
+    li   $a0, 12
+    li   $a1, 23
+    la   $a2, score_digits
+    li   $a3, 5
+    jal  draw_number
+    lw   $ra, 0($sp)
+    lw   $s5, 4($sp)
+    addi $sp, $sp, 8
+    jr   $ra
+
+# update_timer: once per real second, subtract 1 from time_left; game over at 0
+update_timer:
+    addi $sp, $sp, -4
+    sw   $ra, 0($sp)
+    li   $v0, 30                 # current time in ms (low word in $a0)
+    syscall
+    lw   $t0, last_time
+    sub  $t1, $a0, $t0
+    blt  $t1, 1000, ut_ret       # less than a second has passed
+    addi $t0, $t0, 1000
+    sw   $t0, last_time
+    lw   $t2, time_left
+    addi $t2, $t2, -1
+    sw   $t2, time_left
+    jal  draw_time
+    lw   $t2, time_left
+    bgtz $t2, ut_ret
+    li   $v0, 4
+    la   $a0, timeup_msg
+    syscall
+    li   $v0, 10                 # time ran out: exit
+    syscall
+ut_ret:
+    lw   $ra, 0($sp)
+    addi $sp, $sp, 4
+    jr   $ra
+
+# draw_time: split time_left into 3 digits (left_digits) and draw them
+draw_time:
+    addi $sp, $sp, -8
+    sw   $ra, 0($sp)
+    sw   $s5, 4($sp)
+    lw   $t0, time_left
+    bge  $t0, 0, dt_pos
+    li   $t0, 0
+dt_pos:
+    la   $t2, left_digits
+    addi $t2, $t2, 2             # ones digit
+    li   $t3, 10
+    li   $t4, 3
+dt_digit:
+    div  $t0, $t3
+    mfhi $t5
+    mflo $t0
+    sb   $t5, 0($t2)
+    addi $t2, $t2, -1
+    addi $t4, $t4, -1
+    bgtz $t4, dt_digit
+    lw   $s5, white
+    li   $a0, 12
+    li   $a1, 10
+    la   $a2, left_digits
+    li   $a3, 3
+    jal  draw_number
+    lw   $ra, 0($sp)
+    lw   $s5, 4($sp)
+    addi $sp, $sp, 8
     jr   $ra
