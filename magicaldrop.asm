@@ -15,6 +15,29 @@
 # - Base Address for Display:   0x10008000 ($gp)
 ##############################################################################
 
+##############################################################################
+# GAME OVERVIEW AND CONTROLS
+#   A / D : move the character left / right (stops at columns 0 and 6)
+#   S     : grab the lowest bubble in the column and the same-coloured ones directly above it
+#   W     : throw the held bubbles up into the column, under the lowest bubble
+#   Q     : quit
+#
+# How a turn works:
+#   1. Thrown bubbles stack under the lowest bubble of the column.
+#   2. Trigger: a vertical run of 3 or more same-coloured bubbles (score = run length * 2).
+#   3. Explosion: every bubble of that colour connected to the run (up, down, left, right)
+#      is deleted too (flood fill).
+#   4. Nothing else moves: bubbles that were below a deleted bubble stay exactly where
+#      they are (no gravity), so only the exploded bubbles disappear.
+#
+# Other rules:
+#   - Every 10 key presses a new random row is pushed in at the top (advance_row).
+#   - The game ends if a bubble reaches the bottom row (row 13), or when the timer hits 0.
+#
+# Memory: the playing field is the 14 x 7 word array "grid" (row 0 = top, 0 = empty).
+# It is drawn on screen at (col + 2, row + 5) by draw_field.
+##############################################################################
+
     .data
 ##############################################################################
 # Immutable Data
@@ -71,6 +94,11 @@ last_time:   .word 0          # ms timestamp of the last timer tick
 grid:        .space 392       # 14 x 7 cells, 4 bytes each, 0 = empty
 game_over_msg: .asciiz "Game over!\n"
 timeup_msg:    .asciiz "Time's up!\n"
+    .align 2
+dir_r:       .word -1, 1, 0, 0     # row change for up, down, left, right
+dir_c:       .word 0, 0, -1, 1     # column change for up, down, left, right
+mark:        .space 392            # 14 x 7 words, 1 = cell will be deleted this pass
+fstack:      .space 392            # work list of cell indexes for the flood fill
 
 ##############################################################################
 # Code
@@ -327,70 +355,75 @@ text:
     li $a3, 5                 # number of digits to draw
     jal draw_number           # draw the score
 
-    jal fill_grid
+    jal fill_grid             # fill the grid array in memory with random colours in the first fill_rows rows
 
     # ---------------- Start the countdown timer ----------------
-    li   $v0, 30              # syscall 30 = system time in ms (low word in $a0)
+    li   $v0, 30              # syscall 30 = system time in ms (low 32 bits come back in $a0)
     syscall
-    sw   $a0, last_time       # start counting down from now
-    jal  draw_time            # show the initial time (60)
+    sw   $a0, last_time       # remember "now" as the moment the last timer tick happened
+    jal  draw_time            # draw the starting time (60) in the LEFT counter
 
+##############################################################################
+# Main game loop. Every frame: read a key, act on it, tick the timer,
+# redraw the field and the character, then sleep for about 16 ms.
+##############################################################################
 game_loop:
-    lw   $t0, ADDR_KBRD
-    lw   $t1, 0($t0)
-    bne  $t1, 1, redraw           # no key pressed
-    lw   $t2, 4($t0)              # key code
-    beq  $t2, 0x71, quit          # q
-    beq  $t2, 0x61, key_left      # a
-    beq  $t2, 0x64, key_right     # d
-    beq  $t2, 0x73, key_grab      # s
-    beq  $t2, 0x77, key_throw     # w
-    j    redraw
+    lw   $t0, ADDR_KBRD           # $t0 = address of the keyboard (first word = "key ready" flag)
+    lw   $t1, 0($t0)              # $t1 = 1 if a key was pressed, otherwise 0
+    bne  $t1, 1, redraw           # no key pressed: skip input handling and just redraw
+    lw   $t2, 4($t0)              # $t2 = ASCII code of the key that was pressed
+    beq  $t2, 0x71, quit          # q = quit
+    beq  $t2, 0x61, key_left      # a = move left
+    beq  $t2, 0x64, key_right     # d = move right
+    beq  $t2, 0x73, key_grab      # s = grab bubbles from the column
+    beq  $t2, 0x77, key_throw     # w = throw held bubbles into the column
+    j    redraw                   # any other key is ignored
 
 key_left:
-    lw   $t3, player_col
-    beq  $t3, 0, count_key        # left edge
-    addi $t3, $t3, -1
-    sw   $t3, player_col
+    lw   $t3, player_col          # $t3 = current column (0 to 6)
+    beq  $t3, 0, count_key        # already at the left edge: do not move, but still count the key
+    addi $t3, $t3, -1             # move one column left
+    sw   $t3, player_col          # save the new column
     j    count_key
 
 key_right:
-    lw   $t3, player_col
-    beq  $t3, 6, count_key        # right edge
-    addi $t3, $t3, 1
-    sw   $t3, player_col
+    lw   $t3, player_col          # $t3 = current column (0 to 6)
+    beq  $t3, 6, count_key        # already at the right edge: do not move, but still count the key
+    addi $t3, $t3, 1              # move one column right
+    sw   $t3, player_col          # save the new column
     j    count_key
 
 key_grab:
-    jal  grab
+    jal  grab                     # take bubbles from the lowest part of this column into held_count
     j    count_key
 
 key_throw:
-    jal  throw
+    jal  throw                    # place held bubbles in this column, then resolve matches
+                                  # (falls through into count_key)
 
 count_key:
-    lw   $t3, key_count
-    addi $t3, $t3, 1
+    lw   $t3, key_count           # $t3 = keys pressed since the last new row
+    addi $t3, $t3, 1              # count this key
     sw   $t3, key_count
-    blt  $t3, 10, redraw
-    sw   $zero, key_count         # every 10 keys, push a new row
-    jal  advance_row
+    blt  $t3, 10, redraw          # fewer than 10 keys so far: no new row yet
+    sw   $zero, key_count         # every 10 keys: reset the counter ...
+    jal  advance_row              # ... and push a new row in at the top (may end the game)
 
 redraw:
-    jal  update_timer             # tick the countdown once per real second
-    jal  draw_field
-    jal  draw_player
-    li   $v0, 32                  # sleep 16 ms (~60 fps)
-    li   $a0, 16
+    jal  update_timer             # tick the countdown once per real second (ends the game at 0)
+    jal  draw_field               # draw the grid bubbles and the aiming dots
+    jal  draw_player              # draw the character and its held bubbles
+    li   $v0, 32                  # syscall 32 = sleep
+    li   $a0, 16                  # 16 ms, which gives roughly 60 frames per second
     syscall
-    j    game_loop
+    j    game_loop                # next frame
 
 game_over:
-    li   $v0, 4
-    la   $a0, game_over_msg
+    li   $v0, 4                   # syscall 4 = print string
+    la   $a0, game_over_msg       # "Game over!"
     syscall
 quit:
-    li   $v0, 10
+    li   $v0, 10                  # syscall 10 = exit the program
     syscall
 
 random_colour:
@@ -554,221 +587,242 @@ draw_pixel:
     sw  $s5, 0($t0)         # store the colour into that pixel
     jr  $ra                 # return to the caller
 
-# grid_addr: $a0 = row, $a1 = col -> $v0 = grid + (row * 7 + col) * 4  (changes $t0)
+##############################################################################
+# grid_addr: $a0 = row, $a1 = col
+#   returns $v0 = address of grid cell (row, col) = grid + (row * 7 + col) * 4
+#   (the grid has 7 columns and each cell is one 4-byte word). Changes $t0 only.
+##############################################################################
 grid_addr:
-    li   $t0, 7
-    mul  $t0, $a0, $t0
-    add  $t0, $t0, $a1
-    sll  $t0, $t0, 2
-    la   $v0, grid
-    add  $v0, $v0, $t0
+    li   $t0, 7                 # number of columns per row
+    mul  $t0, $a0, $t0          # $t0 = row * 7
+    add  $t0, $t0, $a1          # $t0 = row * 7 + col (the cell index)
+    sll  $t0, $t0, 2            # $t0 = cell index * 4 (byte offset)
+    la   $v0, grid              # $v0 = address of the first cell
+    add  $v0, $v0, $t0          # $v0 = address of this cell
     jr   $ra
 
-# fill_grid: random colours in the first fill_rows rows
+##############################################################################
+# fill_grid: put a random colour in every cell of the first fill_rows rows
+# (the other rows stay 0 = empty). Only changes the grid array, does not draw.
+##############################################################################
 fill_grid:
-    addi $sp, $sp, -12
+    addi $sp, $sp, -12          # save $ra and the two saved registers we use
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
-    li   $s0, 0                 # row
+    li   $s0, 0                 # $s0 = row
 fg_row:
-    lw   $t0, fill_rows
-    bge  $s0, $t0, fg_done
-    li   $s1, 0                 # col
+    lw   $t0, fill_rows         # number of rows to fill
+    bge  $s0, $t0, fg_done      # all requested rows filled
+    li   $s1, 0                 # $s1 = col
 fg_col:
-    bge  $s1, 7, fg_next_row
-    jal  random_colour
-    move $t1, $v0
-    move $a0, $s0
-    move $a1, $s1
-    jal  grid_addr
-    sw   $t1, 0($v0)
-    addi $s1, $s1, 1
+    bge  $s1, 7, fg_next_row    # finished this row
+    jal  random_colour          # $v0 = random colour from the palette
+    move $t1, $v0               # keep the colour ($t1 survives grid_addr)
+    move $a0, $s0               # row
+    move $a1, $s1               # col
+    jal  grid_addr              # $v0 = address of this cell
+    sw   $t1, 0($v0)            # store the colour in the cell
+    addi $s1, $s1, 1            # next column
     j    fg_col
 fg_next_row:
-    addi $s0, $s0, 1
+    addi $s0, $s0, 1            # next row
     j    fg_row
 fg_done:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     addi $sp, $sp, 12
     jr   $ra
 
-# draw_field: draw each cell at (col + 2, row + 5); aim dots on even empty rows of player_col
+##############################################################################
+# draw_field: draw every grid cell on the screen at (col + 2, row + 5).
+# Empty cells are black, except that in the character's column every second
+# empty row is drawn dark grey to make the aiming line.
+##############################################################################
 draw_field:
-    addi $sp, $sp, -16
+    addi $sp, $sp, -16          # save $ra, $s0, $s1 and $s5 (the drawing colour)
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
     sw   $s5, 12($sp)
-    li   $s0, 0                 # row
+    li   $s0, 0                 # $s0 = row
 df_row:
-    bge  $s0, 14, df_done
-    li   $s1, 0                 # col
+    bge  $s0, 14, df_done       # all 14 rows drawn
+    li   $s1, 0                 # $s1 = col
 df_col:
-    bge  $s1, 7, df_next_row
-    move $a0, $s0
-    move $a1, $s1
-    jal  grid_addr
-    lw   $s5, 0($v0)            # colour, 0 = empty
-    bne  $s5, 0, df_draw
-    lw   $t0, player_col
-    bne  $s1, $t0, df_draw
-    andi $t0, $s0, 1
-    bne  $t0, 0, df_draw
-    lw   $s5, dark_grey
+    bge  $s1, 7, df_next_row    # all 7 columns of this row drawn
+    move $a0, $s0               # row
+    move $a1, $s1               # col
+    jal  grid_addr              # $v0 = address of this cell
+    lw   $s5, 0($v0)            # $s5 = colour in the cell (0 = empty = black)
+    bne  $s5, 0, df_draw        # a bubble is here: draw it
+    lw   $t0, player_col        # empty cell: is it in the character's column?
+    bne  $s1, $t0, df_draw      # no: draw it black
+    andi $t0, $s0, 1            # yes: is the row even?
+    bne  $t0, 0, df_draw        # odd row: draw it black (gap between dots)
+    lw   $s5, dark_grey         # even empty row in the aiming column: dark grey dot
 df_draw:
-    addi $a0, $s1, 2
-    addi $a1, $s0, 5
-    jal  draw_pixel
-    addi $s1, $s1, 1
+    addi $a0, $s1, 2            # screen x = col + 2 (inside the left border)
+    addi $a1, $s0, 5            # screen y = row + 5 (inside the top border)
+    jal  draw_pixel             # paint the cell with the colour in $s5
+    addi $s1, $s1, 1            # next column
     j    df_col
 df_next_row:
-    addi $s0, $s0, 1
+    addi $s0, $s0, 1            # next row
     j    df_row
 df_done:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     lw   $s5, 12($sp)
     addi $sp, $sp, 16
     jr   $ra
 
-# draw_player: clear y = 20..30, draw character at y = 20 and held bubbles below it (max 10)
+##############################################################################
+# draw_player: clear the area below the field (y = 20..30), then draw the white
+# character at y = 20 and the held bubbles in a vertical line under it (max 10).
+##############################################################################
 draw_player:
-    addi $sp, $sp, -12
+    addi $sp, $sp, -12          # save $ra, $s0 and $s5
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s5, 8($sp)
-    li   $s5, 0
-    li   $s0, 20
+    li   $s5, 0                 # colour = black, used to erase
+    li   $s0, 20                # $s0 = first row to clear
 dp_clear:
-    bgt  $s0, 30, dp_draw
-    li   $a0, 2
-    move $a1, $s0
-    li   $a2, 7
-    jal  draw_hline
-    addi $s0, $s0, 1
+    bgt  $s0, 30, dp_draw       # rows 20 to 30 cleared
+    li   $a0, 2                 # x = 2 (first field column)
+    move $a1, $s0               # y = current row
+    li   $a2, 7                 # length 7 (all 7 field columns)
+    jal  draw_hline             # erase one row
+    addi $s0, $s0, 1            # next row
     j    dp_clear
 dp_draw:
-    lw   $s5, white
-    lw   $a0, player_col
-    addi $a0, $a0, 2
-    li   $a1, 20
-    jal  draw_pixel
-    lw   $a2, held_count
-    ble  $a2, 10, dp_len_ok
-    li   $a2, 10
+    lw   $s5, white             # the character is white
+    lw   $a0, player_col        # grid column of the character
+    addi $a0, $a0, 2            # screen x = col + 2
+    li   $a1, 20                # screen y = 20 (just below the field)
+    jal  draw_pixel             # draw the character
+    lw   $a2, held_count        # number of bubbles held
+    ble  $a2, 10, dp_len_ok     # up to 10 fit below the character
+    li   $a2, 10                # cap the drawn length at 10
 dp_len_ok:
-    lw   $s5, held_colour
+    lw   $s5, held_colour       # held bubbles use the held colour
     lw   $a0, player_col
-    addi $a0, $a0, 2
-    li   $a1, 21
-    jal  draw_vline
-    lw   $ra, 0($sp)
+    addi $a0, $a0, 2            # same screen x as the character
+    li   $a1, 21                # start right under the character
+    jal  draw_vline             # draw held_count pixels going down (nothing if 0)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s5, 8($sp)
     addi $sp, $sp, 12
     jr   $ra
 
-# grab: take the lowest bubble in player_col and the same-coloured ones above it
+##############################################################################
+# grab: take the lowest bubble in the character's column and every directly
+# connected bubble of the same colour above it. Taken cells become empty and
+# held_count goes up. If bubbles are already held, only the same colour can be added.
+##############################################################################
 grab:
-    addi $sp, $sp, -16
+    addi $sp, $sp, -16          # save $ra, $s0, $s1, $s2
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
     sw   $s2, 12($sp)
-    lw   $s1, player_col
-    li   $s0, 13
+    lw   $s1, player_col        # $s1 = column to grab from
+    li   $s0, 13                # $s0 = row, start at the bottom row and look upwards
 gr_find:
-    blt  $s0, 0, gr_done        # column empty
-    move $a0, $s0
-    move $a1, $s1
+    blt  $s0, 0, gr_done        # went past row 0: the column is empty, nothing to grab
+    move $a0, $s0               # row
+    move $a1, $s1               # col
     jal  grid_addr
-    lw   $t1, 0($v0)
-    bne  $t1, 0, gr_found
-    addi $s0, $s0, -1
+    lw   $t1, 0($v0)            # colour in this cell
+    bne  $t1, 0, gr_found       # first non-empty cell = the lowest bubble
+    addi $s0, $s0, -1           # empty: look one row higher
     j    gr_find
 gr_found:
-    move $s2, $t1
-    lw   $t2, held_count
-    beq  $t2, 0, gr_take
-    lw   $t3, held_colour
-    bne  $s2, $t3, gr_done      # can only add the same colour
+    move $s2, $t1               # $s2 = colour of the lowest bubble
+    lw   $t2, held_count        # are we already holding something?
+    beq  $t2, 0, gr_take        # no: take it freely
+    lw   $t3, held_colour       # yes: the colour must match what we hold
+    bne  $s2, $t3, gr_done      # different colour: grab nothing
 gr_take:
-    blt  $s0, 0, gr_save
-    move $a0, $s0
-    move $a1, $s1
+    blt  $s0, 0, gr_save        # reached the top of the column
+    move $a0, $s0               # row
+    move $a1, $s1               # col
     jal  grid_addr
-    lw   $t1, 0($v0)
-    bne  $t1, $s2, gr_save
-    sw   $zero, 0($v0)
+    lw   $t1, 0($v0)            # colour of this cell
+    bne  $t1, $s2, gr_save      # different colour (or empty): stop taking
+    sw   $zero, 0($v0)          # remove the bubble from the grid
     lw   $t2, held_count
-    addi $t2, $t2, 1
+    addi $t2, $t2, 1            # one more bubble held
     sw   $t2, held_count
-    addi $s0, $s0, -1
+    addi $s0, $s0, -1           # go up one row
     j    gr_take
 gr_save:
-    sw   $s2, held_colour
+    sw   $s2, held_colour       # remember the colour we are holding
 gr_done:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     lw   $s2, 12($sp)
     addi $sp, $sp, 16
     jr   $ra
 
-# advance_row: game over if row 13 is filled, else shift rows down and add a random row 0
+##############################################################################
+# advance_row: if any bubble is in the bottom row (row 13) the game is over.
+# Otherwise shift every row down by one and fill row 0 with a new random row.
+##############################################################################
 advance_row:
-    addi $sp, $sp, -12
+    addi $sp, $sp, -12          # save $ra, $s0, $s1
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
-    li   $s1, 0
+    li   $s1, 0                 # $s1 = col, check row 13 first
 ar_check:
-    bge  $s1, 7, ar_shift_start
-    li   $a0, 13
+    bge  $s1, 7, ar_shift_start # row 13 is empty in every column: safe to shift
+    li   $a0, 13                # bottom row
     move $a1, $s1
     jal  grid_addr
     lw   $t1, 0($v0)
-    bne  $t1, 0, game_over
-    addi $s1, $s1, 1
+    bne  $t1, 0, game_over      # a bubble would be pushed out of the field: game over
+    addi $s1, $s1, 1            # next column
     j    ar_check
 ar_shift_start:
-    li   $s0, 13
+    li   $s0, 13                # $s0 = row to fill, start at the bottom and go up
 ar_shift_row:
-    beq  $s0, 0, ar_new_row
-    li   $s1, 0
+    beq  $s0, 0, ar_new_row     # rows 13..1 now hold the old rows above them
+    li   $s1, 0                 # $s1 = col
 ar_shift_col:
-    bge  $s1, 7, ar_shift_next
-    addi $a0, $s0, -1
+    bge  $s1, 7, ar_shift_next  # this row is done
+    addi $a0, $s0, -1           # row above
     move $a1, $s1
     jal  grid_addr
-    lw   $t1, 0($v0)            # cell above
-    move $a0, $s0
+    lw   $t1, 0($v0)            # $t1 = the colour in the cell above
+    move $a0, $s0               # this row
     move $a1, $s1
     jal  grid_addr
-    sw   $t1, 0($v0)
-    addi $s1, $s1, 1
+    sw   $t1, 0($v0)            # copy it down into this cell
+    addi $s1, $s1, 1            # next column
     j    ar_shift_col
 ar_shift_next:
-    addi $s0, $s0, -1
+    addi $s0, $s0, -1           # go up one row (copying from the bottom up avoids overwriting)
     j    ar_shift_row
 ar_new_row:
-    li   $s1, 0
+    li   $s1, 0                 # $s1 = col, fill row 0 with new random colours
 ar_new_col:
     bge  $s1, 7, ar_done
-    jal  random_colour
+    jal  random_colour          # $v0 = random colour
     move $t1, $v0
-    li   $a0, 0
+    li   $a0, 0                 # row 0
     move $a1, $s1
     jal  grid_addr
-    sw   $t1, 0($v0)
-    addi $s1, $s1, 1
+    sw   $t1, 0($v0)            # store the colour
+    addi $s1, $s1, 1            # next column
     j    ar_new_col
 ar_done:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     addi $sp, $sp, 12
@@ -778,47 +832,50 @@ ar_done:
 # MILESTONE 3
 ##############################################################################
 
-# throw: stack held bubbles under the lowest bubble in player_col, then check matches
+##############################################################################
+# throw: put the held bubbles into the character's column, directly under the
+# lowest bubble (or at the top if the column is empty), then resolve matches.
+# Does nothing if no bubbles are held.
+##############################################################################
 throw:
-    addi $sp, $sp, -20
+    addi $sp, $sp, -20          # save $ra, $s0 to $s3
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
     sw   $s2, 12($sp)
     sw   $s3, 16($sp)
     lw   $t0, held_count
-    beqz $t0, th_done            # nothing held
-    lw   $s1, player_col
-    li   $s0, 13
+    beqz $t0, th_done           # nothing held: nothing to throw
+    lw   $s1, player_col        # $s1 = column to throw into
+    li   $s0, 13                # $s0 = row, search upwards from the bottom
 th_find:
-    blt  $s0, 0, th_place        # empty column: s0 = -1
+    blt  $s0, 0, th_place       # empty column: $s0 = -1
     move $a0, $s0
     move $a1, $s1
     jal  grid_addr
     lw   $t1, 0($v0)
-    bne  $t1, 0, th_place        # found the lowest bubble
-    addi $s0, $s0, -1
+    bne  $t1, 0, th_place       # found the lowest bubble in the column
+    addi $s0, $s0, -1           # empty: look one row higher
     j    th_find
 th_place:
-    addi $s0, $s0, 1             # first free row below the stack
-    lw   $s2, held_colour
-    lw   $s3, held_count
+    addi $s0, $s0, 1            # $s0 = first free row under the stack
+    lw   $s2, held_colour       # $s2 = colour being thrown
+    lw   $s3, held_count        # $s3 = how many bubbles are left to place
 th_loop:
-    beqz $s3, th_end
-    bgt  $s0, 13, th_end         # no room left in the column
+    beqz $s3, th_end            # all placed
+    bgt  $s0, 13, th_end        # no room left in the column: the rest are dropped
     move $a0, $s0
     move $a1, $s1
     jal  grid_addr
-    sw   $s2, 0($v0)
-    addi $s0, $s0, 1
-    addi $s3, $s3, -1
+    sw   $s2, 0($v0)            # put one bubble in this cell
+    addi $s0, $s0, 1            # next row down
+    addi $s3, $s3, -1           # one fewer to place
     j    th_loop
 th_end:
-    sw   $zero, held_count
-    move $a0, $s1
-    jal  resolve_column          # delete matches (and chains)
+    sw   $zero, held_count      # hands are empty now
+    jal  resolve_board          # find vertical triggers and delete the exploded bubbles
 th_done:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     lw   $s2, 12($sp)
@@ -826,79 +883,68 @@ th_done:
     addi $sp, $sp, 20
     jr   $ra
 
-# resolve_column: $a0 = col. Delete vertical runs of 3+ (score = length * 2),
-# pull the bubbles below back up, and repeat while new matches form (chain reaction).
-resolve_column:
-    addi $sp, $sp, -24
+##############################################################################
+# resolve_board: find every vertical run of 3+ (the triggers), flood fill from each
+# one to mark all connected same-coloured bubbles, then delete only the marked
+# bubbles. No other bubble moves. Score per trigger = run length * 2.
+# Registers: $s0 = row, $s1 = col, $s2 = run colour, $s3 = end of run,
+#            $s4 = 1 if this pass found a trigger.
+##############################################################################
+resolve_board:
+    addi $sp, $sp, -24          # save $ra, $s0 to $s4
     sw   $ra, 0($sp)
     sw   $s0, 4($sp)
     sw   $s1, 8($sp)
     sw   $s2, 12($sp)
     sw   $s3, 16($sp)
     sw   $s4, 20($sp)
-    move $s1, $a0                # column
-rc_pass:
-    li   $s4, 0                  # removed-something flag
-    li   $s0, 0                  # i = current row
-rc_scan:
-    bge  $s0, 14, rc_scan_done
+    jal  clear_marks            # start with nothing marked for deletion
+    li   $s4, 0                 # no trigger found yet
+    li   $s1, 0                 # start at column 0
+rb_col:
+    bge  $s1, 7, rb_scan_done   # all columns scanned
+    li   $s0, 0                 # start at the top row of this column
+rb_row:
+    bge  $s0, 14, rb_col_next   # reached the bottom of the column
     move $a0, $s0
     move $a1, $s1
     jal  grid_addr
-    lw   $s2, 0($v0)             # colour at row i
-    bne  $s2, $zero, rc_run
-    addi $s0, $s0, 1
-    j    rc_scan
-rc_run:
-    addi $s3, $s0, 1             # j = end of run (exclusive)
-rc_ext:
-    bge  $s3, 14, rc_end
+    lw   $s2, 0($v0)            # colour at (row, col)
+    bnez $s2, rb_run            # a bubble: measure the vertical run starting here
+    addi $s0, $s0, 1            # empty: next row
+    j    rb_row
+rb_run:
+    addi $s3, $s0, 1            # end of the vertical run (exclusive), at least this one cell
+rb_ext:
+    bge  $s3, 14, rb_end        # hit the bottom of the grid
     move $a0, $s3
     move $a1, $s1
     jal  grid_addr
-    lw   $t1, 0($v0)
-    bne  $t1, $s2, rc_end
-    addi $s3, $s3, 1
-    j    rc_ext
-rc_end:
-    sub  $t2, $s3, $s0           # run length
-    blt  $t2, 3, rc_next
-    sll  $a0, $t2, 1             # points = length * 2
-    jal  add_score
-    li   $s4, 1
-rc_clear:
-    bge  $s0, $s3, rc_next
-    move $a0, $s0
-    move $a1, $s1
-    jal  grid_addr
-    sw   $zero, 0($v0)
-    addi $s0, $s0, 1
-    j    rc_clear
-rc_next:
-    move $s0, $s3                # continue after this run
-    j    rc_scan
-rc_scan_done:
-    beqz $s4, rc_finish          # nothing removed: finished
-    li   $s0, 0                  # read row
-    li   $s3, 0                  # write row: compact bubbles up to the top
-rc_comp:
-    bge  $s0, 14, rc_pass        # compacted: rescan for chain matches
-    move $a0, $s0
-    move $a1, $s1
-    jal  grid_addr
-    lw   $t1, 0($v0)
-    beqz $t1, rc_comp_next
-    sw   $zero, 0($v0)
-    move $a0, $s3
-    move $a1, $s1
-    jal  grid_addr               # only changes $t0, so $t1 is safe
-    sw   $t1, 0($v0)
-    addi $s3, $s3, 1
-rc_comp_next:
-    addi $s0, $s0, 1
-    j    rc_comp
-rc_finish:
-    lw   $ra, 0($sp)
+    lw   $t1, 0($v0)            # colour of the next cell down
+    bne  $t1, $s2, rb_end       # different colour or empty: the run ends
+    addi $s3, $s3, 1            # same colour: the run is one longer
+    j    rb_ext
+rb_end:
+    sub  $t2, $s3, $s0          # $t2 = run length
+    blt  $t2, 3, rb_next        # shorter than 3: not a trigger
+    sll  $a0, $t2, 1            # points = run length * 2
+    jal  add_score              # add to the score and redraw it
+    li   $s4, 1                 # remember that this pass found a trigger
+    move $a0, $s0               # flood fill from the first cell of the run:
+    move $a1, $s1               #   row
+    move $a2, $s2               #   col and colour
+    jal  flood_fill             # marks the run and all connected same-coloured bubbles
+rb_next:
+    move $s0, $s3               # continue scanning after this run
+    j    rb_row
+rb_col_next:
+    addi $s1, $s1, 1            # next column
+    j    rb_col
+rb_scan_done:
+    beqz $s4, rb_finish         # no trigger found: nothing to delete
+    jal  delete_marked          # delete every marked bubble; all other bubbles stay where they are
+rb_finish:
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
     lw   $s1, 8($sp)
     lw   $s2, 12($sp)
@@ -907,95 +953,223 @@ rc_finish:
     addi $sp, $sp, 24
     jr   $ra
 
-# add_score: $a0 = points. Updates score, splits it into 5 digits, redraws it.
+##############################################################################
+# flood_fill: $a0 = row, $a1 = col, $a2 = colour.
+# Marks every cell of that colour that is connected to (row, col) by up, down,
+# left or right steps. "fstack" is a work list of cell indexes still to visit.
+# A cell index is row * 7 + col. A cell is marked before it is pushed, so it
+# is pushed at most once and the list never holds more than 98 cells.
+# Registers: $s0 = cells in the work list, $s1 = colour, $s2 = work list base,
+#            $s3 = cell being visited, $t4 = its row, $t5 = its col.
+##############################################################################
+flood_fill:
+    addi $sp, $sp, -20          # save $ra, $s0 to $s3
+    sw   $ra, 0($sp)
+    sw   $s0, 4($sp)
+    sw   $s1, 8($sp)
+    sw   $s2, 12($sp)
+    sw   $s3, 16($sp)
+    move $s1, $a2               # colour to match
+    li   $t0, 7
+    mul  $t0, $a0, $t0
+    add  $t0, $t0, $a1          # seed index = row * 7 + col
+    sll  $t1, $t0, 2            # byte offset into mark
+    la   $t2, mark
+    add  $t2, $t2, $t1
+    li   $t3, 1
+    sw   $t3, 0($t2)            # mark the seed cell
+    la   $s2, fstack            # base address of the work list
+    sw   $t0, 0($s2)            # push the seed
+    li   $s0, 1                 # the list holds one cell
+ff_loop:
+    beqz $s0, ff_done           # nothing left to visit: finished
+    addi $s0, $s0, -1           # pop one cell
+    sll  $t1, $s0, 2
+    add  $t1, $t1, $s2
+    lw   $s3, 0($t1)            # $s3 = its index
+    li   $t0, 7
+    div  $s3, $t0               # index / 7
+    mflo $t4                    # row = quotient
+    mfhi $t5                    # col = remainder
+    li   $t6, 0                 # direction offset in bytes: 0, 4, 8, 12 (up, down, left, right)
+ff_dir:
+    bge  $t6, 16, ff_loop       # all four directions tried: pop the next cell
+    la   $t7, dir_r
+    add  $t7, $t7, $t6
+    lw   $t7, 0($t7)            # row change for this direction
+    add  $t7, $t4, $t7          # $t7 = neighbour row
+    la   $t8, dir_c
+    add  $t8, $t8, $t6
+    lw   $t8, 0($t8)            # column change for this direction
+    add  $t8, $t5, $t8          # $t8 = neighbour col
+    addi $t6, $t6, 4            # next direction for the following pass
+    bltz $t7, ff_dir            # neighbour is above the top
+    bge  $t7, 14, ff_dir        # neighbour is below the bottom
+    bltz $t8, ff_dir            # neighbour is left of column 0
+    bge  $t8, 7, ff_dir         # neighbour is right of column 6
+    li   $t0, 7
+    mul  $t7, $t7, $t0
+    add  $t7, $t7, $t8          # neighbour index = row * 7 + col
+    sll  $t7, $t7, 2            # byte offset into grid and mark
+    la   $t8, grid
+    add  $t8, $t8, $t7
+    lw   $t9, 0($t8)            # colour of the neighbour
+    bne  $t9, $s1, ff_dir       # different colour (or empty): skip
+    la   $t8, mark
+    add  $t8, $t8, $t7
+    lw   $t9, 0($t8)            # is it already marked?
+    bnez $t9, ff_dir            # yes: skip
+    li   $t9, 1
+    sw   $t9, 0($t8)            # mark it
+    srl  $t7, $t7, 2            # convert the byte offset back to a cell index
+    sll  $t1, $s0, 2
+    add  $t1, $t1, $s2
+    sw   $t7, 0($t1)            # push it onto the work list
+    addi $s0, $s0, 1            # the list is one longer
+    j    ff_dir                 # try the next direction
+ff_done:
+    lw   $ra, 0($sp)            # restore registers and return
+    lw   $s0, 4($sp)
+    lw   $s1, 8($sp)
+    lw   $s2, 12($sp)
+    lw   $s3, 16($sp)
+    addi $sp, $sp, 20
+    jr   $ra
+
+##############################################################################
+# clear_marks: set every cell of the mark array (98 words) to 0.
+##############################################################################
+clear_marks:
+    la   $t0, mark              # pointer to the current word
+    li   $t1, 98                # words left to clear
+cm_loop:
+    beqz $t1, cm_done
+    sw   $zero, 0($t0)          # clear one word
+    addi $t0, $t0, 4            # next word
+    addi $t1, $t1, -1
+    j    cm_loop
+cm_done:
+    jr   $ra
+
+##############################################################################
+# delete_marked: empty every grid cell whose mark is set (98 cells).
+##############################################################################
+delete_marked:
+    la   $t0, mark              # pointer into mark
+    la   $t1, grid              # pointer into grid (same cell index)
+    li   $t2, 98                # cells left to check
+dm_loop:
+    beqz $t2, dm_done
+    lw   $t3, 0($t0)            # mark of this cell
+    beqz $t3, dm_skip           # not marked: leave the bubble
+    sw   $zero, 0($t1)          # marked: delete the bubble
+dm_skip:
+    addi $t0, $t0, 4            # next cell
+    addi $t1, $t1, 4
+    addi $t2, $t2, -1
+    j    dm_loop
+dm_done:
+    jr   $ra
+
+##############################################################################
+# add_score: $a0 = points to add. Updates score, splits it into 5 decimal
+# digits (score_digits) and redraws the score under PTS.
+##############################################################################
 add_score:
-    addi $sp, $sp, -8
+    addi $sp, $sp, -8           # save $ra and $s5 (the drawing colour)
     sw   $ra, 0($sp)
     sw   $s5, 4($sp)
     lw   $t0, score
-    add  $t0, $t0, $a0
-    ble  $t0, 99999, as_ok
-    li   $t0, 99999              # cap at 5 digits
+    add  $t0, $t0, $a0          # new score
+    ble  $t0, 99999, as_ok      # fits in 5 digits
+    li   $t0, 99999             # otherwise cap at 99999
 as_ok:
-    sw   $t0, score
+    sw   $t0, score             # save the new score
     la   $t2, score_digits
-    addi $t2, $t2, 4             # start at the last (ones) digit
-    li   $t3, 10
-    li   $t4, 5
+    addi $t2, $t2, 4            # start at the last digit (the ones place)
+    li   $t3, 10                # divisor
+    li   $t4, 5                 # digits left to store
 as_digit:
-    div  $t0, $t3
-    mfhi $t5
-    mflo $t0
-    sb   $t5, 0($t2)
-    addi $t2, $t2, -1
+    div  $t0, $t3               # score / 10
+    mfhi $t5                    # remainder = this digit
+    mflo $t0                    # quotient = the rest of the number
+    sb   $t5, 0($t2)            # store the digit
+    addi $t2, $t2, -1           # move to the next digit to the left
     addi $t4, $t4, -1
     bgtz $t4, as_digit
-    lw   $s5, white
-    li   $a0, 12
-    li   $a1, 23
-    la   $a2, score_digits
-    li   $a3, 5
+    lw   $s5, white             # draw in white
+    li   $a0, 12                # x of the first digit
+    li   $a1, 23                # y of the score row
+    la   $a2, score_digits      # the 5 digit bytes
+    li   $a3, 5                 # number of digits
     jal  draw_number
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s5, 4($sp)
     addi $sp, $sp, 8
     jr   $ra
 
-# update_timer: once per real second, subtract 1 from time_left; game over at 0
+##############################################################################
+# update_timer: once per real second, subtract 1 from time_left and redraw it.
+# When it reaches 0 print "Time's up!" and exit. Uses the system clock, so the
+# countdown speed does not depend on the frame rate.
+##############################################################################
 update_timer:
-    addi $sp, $sp, -4
+    addi $sp, $sp, -4           # save $ra
     sw   $ra, 0($sp)
-    li   $v0, 30                 # current time in ms (low word in $a0)
+    li   $v0, 30                # syscall 30 = current time in ms (low word in $a0)
     syscall
-    lw   $t0, last_time
-    sub  $t1, $a0, $t0
-    blt  $t1, 1000, ut_ret       # less than a second has passed
-    addi $t0, $t0, 1000
+    lw   $t0, last_time         # time of the last tick
+    sub  $t1, $a0, $t0          # ms since the last tick
+    blt  $t1, 1000, ut_ret      # less than a second has passed
+    addi $t0, $t0, 1000         # move the tick time forward by exactly one second
     sw   $t0, last_time
     lw   $t2, time_left
-    addi $t2, $t2, -1
+    addi $t2, $t2, -1           # one second less
     sw   $t2, time_left
-    jal  draw_time
-    lw   $t2, time_left
-    bgtz $t2, ut_ret
-    li   $v0, 4
-    la   $a0, timeup_msg
+    jal  draw_time              # redraw the LEFT counter
+    lw   $t2, time_left         # reload (draw_time changed the temporaries)
+    bgtz $t2, ut_ret            # still time left
+    li   $v0, 4                 # syscall 4 = print string
+    la   $a0, timeup_msg        # "Time's up!"
     syscall
-    li   $v0, 10                 # time ran out: exit
+    li   $v0, 10                # syscall 10 = exit
     syscall
 ut_ret:
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore $ra and return
     addi $sp, $sp, 4
     jr   $ra
 
-# draw_time: split time_left into 3 digits (left_digits) and draw them
+##############################################################################
+# draw_time: split time_left into 3 decimal digits (left_digits) and draw them
+# in the LEFT counter. A negative time is shown as 0.
+##############################################################################
 draw_time:
-    addi $sp, $sp, -8
+    addi $sp, $sp, -8           # save $ra and $s5 (the drawing colour)
     sw   $ra, 0($sp)
     sw   $s5, 4($sp)
     lw   $t0, time_left
-    bge  $t0, 0, dt_pos
-    li   $t0, 0
+    bge  $t0, 0, dt_pos         # not negative
+    li   $t0, 0                 # clamp to 0
 dt_pos:
     la   $t2, left_digits
-    addi $t2, $t2, 2             # ones digit
-    li   $t3, 10
-    li   $t4, 3
+    addi $t2, $t2, 2            # start at the last digit (the ones place)
+    li   $t3, 10                # divisor
+    li   $t4, 3                 # digits left to store
 dt_digit:
-    div  $t0, $t3
-    mfhi $t5
-    mflo $t0
-    sb   $t5, 0($t2)
-    addi $t2, $t2, -1
+    div  $t0, $t3               # time / 10
+    mfhi $t5                    # remainder = this digit
+    mflo $t0                    # quotient = the rest of the number
+    sb   $t5, 0($t2)            # store the digit
+    addi $t2, $t2, -1           # move to the next digit to the left
     addi $t4, $t4, -1
     bgtz $t4, dt_digit
-    lw   $s5, white
-    li   $a0, 12
-    li   $a1, 10
-    la   $a2, left_digits
-    li   $a3, 3
+    lw   $s5, white             # draw in white
+    li   $a0, 12                # x of the first digit
+    li   $a1, 10                # y of the LEFT counter row
+    la   $a2, left_digits       # the 3 digit bytes
+    li   $a3, 3                 # number of digits
     jal  draw_number
-    lw   $ra, 0($sp)
+    lw   $ra, 0($sp)            # restore registers and return
     lw   $s5, 4($sp)
     addi $sp, $sp, 8
     jr   $ra
