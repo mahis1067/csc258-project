@@ -30,6 +30,8 @@
 #   3. Explosion: every bubble of that colour connected to the run (up, down, left, right)
 #      is deleted too (flood fill).
 #   4. Gravity: in every column the remaining bubbles float up to fill the empty gaps.
+#   5. Chain reaction: after gravity the board is scanned again, because floating
+#      bubbles can line up a new vertical run of 3+. This repeats until no trigger is left.
 #
 # Other rules:
 #   - Every 10 key presses a new random row is pushed in at the top (advance_row).
@@ -109,6 +111,7 @@ font_A: .byte 2,5,7,5,5
 font_D: .byte 6,5,5,5,6
 font_E: .byte 7,4,6,4,7
 font_G: .byte 3,4,5,5,3
+font_H: .byte 5,5,7,5,5
 font_M: .byte 5,7,7,5,5
 font_O: .byte 7,5,5,5,7
 font_P: .byte 6,5,6,4,4
@@ -128,6 +131,10 @@ word_game:   .word font_G, font_A, font_M, font_E
 word_over:   .word font_O, font_V, font_E, font_R
 word_retry:  .word font_R, font_sp, font_R, font_E, font_T, font_R, font_Y
 word_quit:   .word font_Q, font_sp, font_Q, font_U, font_I, font_T
+word_easy:   .word font_E, font_A, font_S, font_Y
+word_medium: .word font_M, font_E, font_D, font_I, font_U, font_M
+word_hard:   .word font_H, font_A, font_R, font_D
+
 
 ##############################################################################
 # Code
@@ -138,6 +145,9 @@ word_quit:   .word font_Q, font_sp, font_Q, font_U, font_I, font_T
 main:
     sw   $sp, start_sp        # remember where the stack starts (used by retry)
     jal  reset_game           # clear the screen and put every variable back to its start value
+    
+    jal  select_difficulty # Display the difficulty menu and wait for selection
+    jal  clear_screen            # Erase difficulty menu after selection
 
     lw $s5, grey            # colour
     li $s0, 1               # left x
@@ -529,6 +539,94 @@ pause_wait:
     syscall
     sw   $a0, last_time           # restart the timer from now so paused time is not counted
     j    game_loop
+    
+##############################################################################
+# select_difficulty
+#
+# Displays the difficulty selection menu.
+#
+# 1 = Easy   -> 4 starting rows
+# 2 = Medium -> 6 starting rows
+# 3 = Hard   -> 8 starting rows
+#
+# The player presses 1, 2, or 3 on the keyboard to choose a difficulty.
+##############################################################################
+
+select_difficulty:
+    addi $sp, $sp, -4          # Make space on the stack for $ra
+    sw   $ra, 0($sp)           # Save return address because we use jal below
+    jal  clear_screen          # Erase the previous screen and prepare the menu
+    lw   $s5, white             # Load white into $s5 so menu text is white
+    li   $a0, 16                # Set x-coordinate for the number 1
+    li   $a1, 8                 # Set y-coordinate for the number 1
+    li   $a2, 1                 # Pass digit 1 to draw_digit
+    jal  draw_digit             # Draw the number 1 on the screen
+
+    li   $a0, 22                # Set starting x-coordinate for EASY
+    li   $a1, 8                 # Set y-coordinate for EASY
+    la   $a2, word_easy         # Load address of the EASY font pointer array
+    li   $a3, 4                 # Tell draw_word there are 4 letters
+    jal  draw_word              # Draw EASY on the screen
+
+    li   $a0, 16                # Set x-coordinate for the number 2
+    li   $a1, 15                # Set y-coordinate for the number 2
+    li   $a2, 2                 # Pass digit 2 to draw_digit
+    jal  draw_digit             # Draw the number 2 on the screen
+
+    li   $a0, 22                # Set starting x-coordinate for MEDIUM
+    li   $a1, 15                # Set y-coordinate for MEDIUM
+    la   $a2, word_medium       # Load address of the MEDIUM font pointer array
+    li   $a3, 6                 # Tell draw_word there are 6 letters
+    jal  draw_word              # Draw MEDIUM on the screen
+
+    li   $a0, 16                # Set x-coordinate for the number 3
+    li   $a1, 22                # Set y-coordinate for the number 3
+    li   $a2, 3                 # Pass digit 3 to draw_digit
+    jal  draw_digit             # Draw the number 3 on the screen
+
+    li   $a0, 22                # Set starting x-coordinate for HARD
+    li   $a1, 22                # Set y-coordinate for HARD
+    la   $a2, word_hard         # Load address of the HARD font pointer array
+    li   $a3, 4                 # Tell draw_word there are 4 letters
+    jal  draw_word              # Draw HARD on the screen
+
+difficulty_wait:
+    li   $v0, 32                # Select the sleep syscall
+    li   $a0, 16                # Sleep for 16 milliseconds
+    syscall                     # Pause briefly to avoid constantly polling
+
+    lw   $t0, ADDR_KBRD         # Load address of keyboard input device
+    lw   $t1, 0($t0)            # Read keyboard control/status register
+
+    bne  $t1, 1, difficulty_wait # If no key is available, keep waiting
+
+    lw   $t2, 4($t0)            # Read the actual key that was pressed
+
+    beq  $t2, 0x31, difficulty_easy   # ASCII '1' selects Easy
+    beq  $t2, 0x32, difficulty_medium # ASCII '2' selects Medium
+    beq  $t2, 0x33, difficulty_hard   # ASCII '3' selects Hard
+
+    j    difficulty_wait              # Ignore any other key and keep waiting
+
+
+difficulty_easy:
+    li   $t0, 4                 # Load 4 into temporary register $t0
+    sw   $t0, fill_rows         # Store 4 into fill_rows
+    j    difficulty_done         # Jump to the end of the selection procedure
+
+difficulty_medium:
+    li   $t0, 6                 # Load 6 into temporary register $t0
+    sw   $t0, fill_rows         # Store 6 into fill_rows
+    j    difficulty_done         # Jump to the end of the selection procedure
+
+difficulty_hard:
+    li   $t0, 8                 # Load 8 into temporary register $t0
+    sw   $t0, fill_rows         # Store 8 into fill_rows
+
+difficulty_done:
+    lw   $ra, 0($sp)            # Restore the saved return address
+    addi $sp, $sp, 4            # Restore stack pointer
+    jr   $ra                    # Return to main
 
 random_colour:
     li $v0, 42              # syscall 42 = random integer in a range
@@ -991,6 +1089,9 @@ th_done:
 # resolve_board: find every vertical run of 3+ (the triggers), flood fill from each
 # one to mark all connected same-coloured bubbles, then delete only the marked
 # bubbles, then apply gravity. Score per trigger = run length * 2.
+# After gravity the whole scan starts again (chain reaction), because bubbles that
+# floated up may have formed a new vertical run of 3+. It stops when a full pass
+# finds no trigger.
 # Registers: $s0 = row, $s1 = col, $s2 = run colour, $s3 = end of run,
 #            $s4 = 1 if this pass found a trigger.
 ##############################################################################
@@ -1002,6 +1103,7 @@ resolve_board:
     sw   $s2, 12($sp)
     sw   $s3, 16($sp)
     sw   $s4, 20($sp)
+rb_start:                       # NEW: each pass of the scan (re)starts here
     jal  clear_marks            # start with nothing marked for deletion
     li   $s4, 0                 # no trigger found yet
     li   $s1, 0                 # start at column 0
@@ -1045,9 +1147,11 @@ rb_col_next:
     addi $s1, $s1, 1            # next column
     j    rb_col
 rb_scan_done:
-    beqz $s4, rb_finish         # no trigger found: nothing to delete
+    beqz $s4, rb_finish         # no trigger found: nothing to delete, we are done
     jal  delete_marked          # delete every marked bubble
-    jal  apply_gravity          # remaining bubbles float up to fill the gaps
+    jal  apply_gravity          # remaining bubbles (e.g. the G) float up to fill the gaps
+    j    rb_start               # NEW: gravity may have lined up a new run of 3+,
+                                #      so scan the board again (chain reaction)
 rb_finish:
     lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
