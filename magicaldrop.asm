@@ -20,19 +20,21 @@
 #   A / D : move the character left / right (stops at columns 0 and 6)
 #   S     : grab the lowest bubble in the column and the same-coloured ones directly above it
 #   W     : throw the held bubbles up into the column, under the lowest bubble
+#   P     : pause / unpause (PAUSED is shown to the right of the game)
 #   Q     : quit
+#   R     : on the GAME OVER screen, start a brand new game
 #
 # How a turn works:
 #   1. Thrown bubbles stack under the lowest bubble of the column.
 #   2. Trigger: a vertical run of 3 or more same-coloured bubbles (score = run length * 2).
 #   3. Explosion: every bubble of that colour connected to the run (up, down, left, right)
 #      is deleted too (flood fill).
-#   4. Nothing else moves: bubbles that were below a deleted bubble stay exactly where
-#      they are (no gravity), so only the exploded bubbles disappear.
+#   4. Gravity: in every column the remaining bubbles float up to fill the empty gaps.
 #
 # Other rules:
 #   - Every 10 key presses a new random row is pushed in at the top (advance_row).
 #   - The game ends if a bubble reaches the bottom row (row 13), or when the timer hits 0.
+#     A GAME OVER screen is drawn; press r to retry or q to quit.
 #
 # Memory: the playing field is the 14 x 7 word array "grid" (row 0 = top, 0 = empty).
 # It is drawn on screen at (col + 2, row + 5) by draw_field.
@@ -91,14 +93,41 @@ key_count:   .word 0          # keys since the last new row
 score:       .word 0          # current score (shown in the PTS counter)
 time_left:   .word 60         # seconds remaining (shown in the LEFT counter)
 last_time:   .word 0          # ms timestamp of the last timer tick
+start_sp:    .word 0          # stack pointer at the start of main (restored on retry)
 grid:        .space 392       # 14 x 7 cells, 4 bytes each, 0 = empty
-game_over_msg: .asciiz "Game over!\n"
+game_over_msg: .asciiz "Game over! Press r to retry or q to quit.\n"
 timeup_msg:    .asciiz "Time's up!\n"
     .align 2
 dir_r:       .word -1, 1, 0, 0     # row change for up, down, left, right
 dir_c:       .word 0, 0, -1, 1     # column change for up, down, left, right
 mark:        .space 392            # 14 x 7 words, 1 = cell will be deleted this pass
 fstack:      .space 392            # work list of cell indexes for the flood fill
+
+# 3 x 5 pixel letters. One byte per row (top to bottom), 3 bits per row:
+# 4 = left pixel, 2 = middle pixel, 1 = right pixel (so 7 = all three).
+font_A: .byte 2,5,7,5,5
+font_D: .byte 6,5,5,5,6
+font_E: .byte 7,4,6,4,7
+font_G: .byte 3,4,5,5,3
+font_M: .byte 5,7,7,5,5
+font_O: .byte 7,5,5,5,7
+font_P: .byte 6,5,6,4,4
+font_R: .byte 6,5,6,5,5
+font_S: .byte 3,4,2,1,6
+font_U: .byte 5,5,5,5,7
+font_V: .byte 5,5,5,5,2
+font_I: .byte 7,2,2,2,7
+font_Q: .byte 2,5,5,6,3
+font_T: .byte 7,2,2,2,2
+font_Y: .byte 5,5,2,2,2
+font_sp: .byte 0,0,0,0,0          # space
+    .align 2
+# words to draw: a list of letter addresses
+word_paused: .word font_P, font_A, font_U, font_S, font_E, font_D
+word_game:   .word font_G, font_A, font_M, font_E
+word_over:   .word font_O, font_V, font_E, font_R
+word_retry:  .word font_R, font_sp, font_R, font_E, font_T, font_R, font_Y
+word_quit:   .word font_Q, font_sp, font_Q, font_U, font_I, font_T
 
 ##############################################################################
 # Code
@@ -107,6 +136,9 @@ fstack:      .space 392            # work list of cell indexes for the flood fil
 	.globl main
 
 main:
+    sw   $sp, start_sp        # remember where the stack starts (used by retry)
+    jal  reset_game           # clear the screen and put every variable back to its start value
+
     lw $s5, grey            # colour
     li $s0, 1               # left x
     li $s1, 9               # right x
@@ -377,6 +409,7 @@ game_loop:
     beq  $t2, 0x64, key_right     # d = move right
     beq  $t2, 0x73, key_grab      # s = grab bubbles from the column
     beq  $t2, 0x77, key_throw     # w = throw held bubbles into the column
+    beq  $t2, 0x70, pause         # p = pause
     j    redraw                   # any other key is ignored
 
 key_left:
@@ -418,13 +451,84 @@ redraw:
     syscall
     j    game_loop                # next frame
 
+##############################################################################
+# Game over screen: clear the display, draw GAME OVER, then wait for
+# r (start a brand new game) or q (quit).
+##############################################################################
 game_over:
+    jal  clear_screen             # wipe the whole display
+    lw   $s5, white
+    li   $a0, 24                  # x
+    li   $a1, 5                   # y
+    la   $a2, word_game
+    li   $a3, 4                   # 4 letters
+    jal  draw_word                # GAME
+    li   $a0, 24
+    li   $a1, 11
+    la   $a2, word_over
+    li   $a3, 4
+    jal  draw_word                # OVER
+    lw   $s5, grey
+    li   $a0, 18
+    li   $a1, 19
+    la   $a2, word_retry
+    li   $a3, 7
+    jal  draw_word                # R RETRY
+    li   $a0, 18
+    li   $a1, 25
+    la   $a2, word_quit
+    li   $a3, 6
+    jal  draw_word                # Q QUIT
     li   $v0, 4                   # syscall 4 = print string
-    la   $a0, game_over_msg       # "Game over!"
+    la   $a0, game_over_msg       # "Game over! Press r to retry or q to quit."
     syscall
+go_wait:
+    li   $v0, 32                  # sleep 16 ms so we are not checking non-stop
+    li   $a0, 16
+    syscall
+    lw   $t0, ADDR_KBRD
+    lw   $t1, 0($t0)
+    bne  $t1, 1, go_wait          # no key yet: keep waiting
+    lw   $t2, 4($t0)
+    beq  $t2, 0x71, quit          # q = quit
+    bne  $t2, 0x72, go_wait       # anything other than r: keep waiting
+    lw   $sp, start_sp            # undo stack space left by the function that ended the game
+    j    main                     # r = brand new game (main resets everything)
+
 quit:
     li   $v0, 10                  # syscall 10 = exit the program
     syscall
+
+##############################################################################
+# Pause: show PAUSED, wait until p is pressed again, erase PAUSED, resume.
+##############################################################################
+pause:
+    lw   $s5, white
+    li   $a0, 34                  # x (to the right of the game)
+    li   $a1, 4                   # y
+    la   $a2, word_paused
+    li   $a3, 6                   # 6 letters
+    jal  draw_word                # PAUSED
+pause_wait:
+    li   $v0, 32                  # sleep 16 ms
+    li   $a0, 16
+    syscall
+    lw   $t0, ADDR_KBRD
+    lw   $t1, 0($t0)
+    bne  $t1, 1, pause_wait       # no key yet: keep waiting
+    lw   $t2, 4($t0)
+    beq  $t2, 0x71, quit          # q still quits while paused
+    bne  $t2, 0x70, pause_wait    # anything other than p: keep waiting
+    li   $s5, 0                   # black
+    li   $a0, 34
+    li   $a1, 4
+    la   $a2, word_paused
+    li   $a3, 6
+    jal  draw_word                # erase PAUSED by drawing it in black
+    li   $v0, 30                  # syscall 30 = current time in ms
+    syscall
+    sw   $a0, last_time           # restart the timer from now so paused time is not counted
+    j    game_loop
 
 random_colour:
     li $v0, 42              # syscall 42 = random integer in a range
@@ -886,7 +990,7 @@ th_done:
 ##############################################################################
 # resolve_board: find every vertical run of 3+ (the triggers), flood fill from each
 # one to mark all connected same-coloured bubbles, then delete only the marked
-# bubbles. No other bubble moves. Score per trigger = run length * 2.
+# bubbles, then apply gravity. Score per trigger = run length * 2.
 # Registers: $s0 = row, $s1 = col, $s2 = run colour, $s3 = end of run,
 #            $s4 = 1 if this pass found a trigger.
 ##############################################################################
@@ -942,7 +1046,8 @@ rb_col_next:
     j    rb_col
 rb_scan_done:
     beqz $s4, rb_finish         # no trigger found: nothing to delete
-    jal  delete_marked          # delete every marked bubble; all other bubbles stay where they are
+    jal  delete_marked          # delete every marked bubble
+    jal  apply_gravity          # remaining bubbles float up to fill the gaps
 rb_finish:
     lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
@@ -1110,7 +1215,7 @@ as_digit:
 
 ##############################################################################
 # update_timer: once per real second, subtract 1 from time_left and redraw it.
-# When it reaches 0 print "Time's up!" and exit. Uses the system clock, so the
+# When it reaches 0 print "Time's up!" and go to the game over screen. Uses the system clock, so the
 # countdown speed does not depend on the frame rate.
 ##############################################################################
 update_timer:
@@ -1132,8 +1237,7 @@ update_timer:
     li   $v0, 4                 # syscall 4 = print string
     la   $a0, timeup_msg        # "Time's up!"
     syscall
-    li   $v0, 10                # syscall 10 = exit
-    syscall
+    j    game_over              # show the game over screen
 ut_ret:
     lw   $ra, 0($sp)            # restore $ra and return
     addi $sp, $sp, 4
@@ -1172,4 +1276,174 @@ dt_digit:
     lw   $ra, 0($sp)            # restore registers and return
     lw   $s5, 4($sp)
     addi $sp, $sp, 8
+    jr   $ra
+
+##############################################################################
+# apply_gravity: in every column, move the bubbles up so there are no empty
+# cells above any bubble. Order in the column stays the same.
+# $s0 = col, $s1 = row being read, $s2 = highest free row (where the next bubble goes)
+##############################################################################
+apply_gravity:
+    addi $sp, $sp, -16          # save $ra, $s0, $s1, $s2
+    sw   $ra, 0($sp)
+    sw   $s0, 4($sp)
+    sw   $s1, 8($sp)
+    sw   $s2, 12($sp)
+    li   $s0, 0                 # col = 0
+ag_col:
+    bge  $s0, 7, ag_done        # all columns done
+    li   $s1, 0                 # read row = 0 (top)
+    li   $s2, 0                 # free row = 0 (top)
+ag_row:
+    bge  $s1, 14, ag_col_next   # whole column read
+    move $a0, $s1
+    move $a1, $s0
+    jal  grid_addr
+    lw   $t1, 0($v0)            # colour at the read row
+    beqz $t1, ag_skip           # empty: nothing to move
+    beq  $s1, $s2, ag_keep      # already in the highest free row
+    sw   $zero, 0($v0)          # empty the old cell
+    move $a0, $s2
+    move $a1, $s0
+    jal  grid_addr              # ($t1 is not changed by grid_addr)
+    sw   $t1, 0($v0)            # put the bubble in the highest free row
+ag_keep:
+    addi $s2, $s2, 1            # next free row is one lower
+ag_skip:
+    addi $s1, $s1, 1            # read the next row down
+    j    ag_row
+ag_col_next:
+    addi $s0, $s0, 1            # next column
+    j    ag_col
+ag_done:
+    lw   $ra, 0($sp)            # restore registers and return
+    lw   $s0, 4($sp)
+    lw   $s1, 8($sp)
+    lw   $s2, 12($sp)
+    addi $sp, $sp, 16
+    jr   $ra
+
+##############################################################################
+# reset_game: clear the screen and put every game variable back to its start
+# value, so a retry is a brand new game.
+##############################################################################
+reset_game:
+    addi $sp, $sp, -4           # save $ra
+    sw   $ra, 0($sp)
+    jal  clear_screen
+    la   $t0, grid              # empty all 98 grid cells
+    li   $t1, 98
+rg_grid:
+    beqz $t1, rg_vars
+    sw   $zero, 0($t0)
+    addi $t0, $t0, 4
+    addi $t1, $t1, -1
+    j    rg_grid
+rg_vars:
+    li   $t0, 3
+    sw   $t0, player_col        # character back in the middle
+    sw   $zero, held_count      # holding nothing
+    sw   $zero, held_colour
+    sw   $zero, key_count
+    sw   $zero, score
+    li   $t0, 60
+    sw   $t0, time_left         # timer back to 60 seconds
+    la   $t0, score_digits      # score display back to 00000
+    li   $t1, 5
+rg_digits:
+    beqz $t1, rg_done
+    sb   $zero, 0($t0)
+    addi $t0, $t0, 1
+    addi $t1, $t1, -1
+    j    rg_digits
+rg_done:
+    lw   $ra, 0($sp)            # restore $ra and return
+    addi $sp, $sp, 4
+    jr   $ra
+
+##############################################################################
+# clear_screen: paint every unit of the 64 x 32 display black.
+##############################################################################
+clear_screen:
+    lw   $t0, ADDR_DSPL         # pointer to the first unit
+    li   $t1, 2048              # 64 * 32 units
+cs_loop:
+    beqz $t1, cs_done
+    sw   $zero, 0($t0)          # black
+    addi $t0, $t0, 4            # next unit
+    addi $t1, $t1, -1
+    j    cs_loop
+cs_done:
+    jr   $ra
+
+##############################################################################
+# draw_word: $a0 = x, $a1 = y, $a2 = address of a list of letter addresses,
+#            $a3 = number of letters, $s5 = colour. Letters are 4 apart.
+##############################################################################
+draw_word:
+    addi $sp, $sp, -20          # save $ra, $s0 to $s3
+    sw   $ra, 0($sp)
+    sw   $s0, 4($sp)
+    sw   $s1, 8($sp)
+    sw   $s2, 12($sp)
+    sw   $s3, 16($sp)
+    move $s0, $a0               # current x
+    move $s1, $a1               # y
+    move $s2, $a2               # pointer into the letter list
+    move $s3, $a3               # letters left
+dw_loop:
+    beqz $s3, dw_done
+    move $a0, $s0
+    move $a1, $s1
+    lw   $a2, 0($s2)            # address of this letter's 5 row bytes
+    jal  draw_letter
+    addi $s0, $s0, 4            # 3 wide + 1 gap
+    addi $s2, $s2, 4            # next letter address
+    addi $s3, $s3, -1
+    j    dw_loop
+dw_done:
+    lw   $ra, 0($sp)            # restore registers and return
+    lw   $s0, 4($sp)
+    lw   $s1, 8($sp)
+    lw   $s2, 12($sp)
+    lw   $s3, 16($sp)
+    addi $sp, $sp, 20
+    jr   $ra
+
+##############################################################################
+# draw_letter: $a0 = x, $a1 = y, $a2 = address of 5 row bytes, $s5 = colour.
+# For each of the 5 rows and 3 columns, draw a pixel if that bit is 1.
+# (draw_pixel only changes $t0 and $t1, so $t2 to $t9 are safe here.)
+##############################################################################
+draw_letter:
+    addi $sp, $sp, -4           # save $ra
+    sw   $ra, 0($sp)
+    move $t5, $a0               # base x
+    move $t6, $a1               # base y
+    move $t7, $a2               # address of the row bytes
+    li   $t2, 0                 # row = 0
+dl_row:
+    bge  $t2, 5, dl_done        # all 5 rows drawn
+    add  $t8, $t7, $t2
+    lb   $t4, 0($t8)            # bits for this row
+    li   $t3, 0                 # col = 0
+dl_col:
+    bge  $t3, 3, dl_next_row    # all 3 columns of this row done
+    li   $t8, 2
+    sub  $t8, $t8, $t3          # shift = 2 - col (the left pixel is the highest bit)
+    srlv $t9, $t4, $t8
+    andi $t9, $t9, 1            # 1 = draw this pixel
+    beqz $t9, dl_skip
+    add  $a0, $t5, $t3          # x = base x + col
+    add  $a1, $t6, $t2          # y = base y + row
+    jal  draw_pixel
+dl_skip:
+    addi $t3, $t3, 1            # next column
+    j    dl_col
+dl_next_row:
+    addi $t2, $t2, 1            # next row
+    j    dl_row
+dl_done:
+    lw   $ra, 0($sp)            # restore $ra and return
+    addi $sp, $sp, 4
     jr   $ra
