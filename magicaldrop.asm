@@ -34,7 +34,12 @@
 #      bubbles can line up a new vertical run of 3+. This repeats until no trigger is left.
 #
 # Other rules:
-#   - Every 10 key presses a new random row is pushed in at the top (advance_row).
+#   - A new random row is pushed in at the top (advance_row). How often depends on the mode
+#     chosen on the start menu:
+#       1 Standard: every 10 key presses
+#       2 Easy:     every 10 seconds
+#       3 Medium:   every 7 seconds
+#       4 Hard:     every 5 seconds
 #   - The game ends if a bubble reaches the bottom row (row 13), or when the timer hits 0.
 #     A GAME OVER screen is drawn; press r to retry or q to quit.
 #
@@ -65,6 +70,9 @@ palette: .word 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00   # red, green, blue, yell
 
 # ---------------- Game variables (change these while playing) ----------------
 fill_rows:   .word 4          # how many rows of bricks are filled from the top (max 14)
+row_mode:    .word 0          # NEW: 0 = new row every row_interval KEY PRESSES, 1 = every row_interval SECONDS
+row_interval: .word 10        # NEW: key presses (mode 0) or seconds (mode 1) between new rows
+row_secs:    .word 0          # NEW: seconds since the last new row (only used in timer modes)
 aim_x:       .word 5          # x column of the character and aiming line (centre of box)
 held_colour: .word 0          # colour the character is holding (set at startup)
 next_colour: .word 0          # colour that will be held next (set at startup)
@@ -113,6 +121,7 @@ font_E: .byte 7,4,6,4,7
 font_G: .byte 3,4,5,5,3
 font_H: .byte 5,5,7,5,5
 font_M: .byte 5,7,7,5,5
+font_N: .byte 7,5,5,5,5           # NEW: N (needed for STANDARD)
 font_O: .byte 7,5,5,5,7
 font_P: .byte 6,5,6,4,4
 font_R: .byte 6,5,6,5,5
@@ -131,6 +140,7 @@ word_game:   .word font_G, font_A, font_M, font_E
 word_over:   .word font_O, font_V, font_E, font_R
 word_retry:  .word font_R, font_sp, font_R, font_E, font_T, font_R, font_Y
 word_quit:   .word font_Q, font_sp, font_Q, font_U, font_I, font_T
+word_standard: .word font_S, font_T, font_A, font_N, font_D, font_A, font_R, font_D   # NEW
 word_easy:   .word font_E, font_A, font_S, font_Y
 word_medium: .word font_M, font_E, font_D, font_I, font_U, font_M
 word_hard:   .word font_H, font_A, font_R, font_D
@@ -146,8 +156,8 @@ main:
     sw   $sp, start_sp        # remember where the stack starts (used by retry)
     jal  reset_game           # clear the screen and put every variable back to its start value
     
-    jal  select_difficulty # Display the difficulty menu and wait for selection
-    jal  clear_screen            # Erase difficulty menu after selection
+    jal  select_difficulty # Display the mode menu and wait for selection
+    jal  clear_screen            # Erase the menu after selection
 
     lw $s5, grey            # colour
     li $s0, 1               # left x
@@ -445,11 +455,14 @@ key_throw:
                                   # (falls through into count_key)
 
 count_key:
+    lw   $t4, row_mode            # NEW: which mode are we in?
+    bnez $t4, redraw              # NEW: timer modes: key presses do not advance rows
     lw   $t3, key_count           # $t3 = keys pressed since the last new row
     addi $t3, $t3, 1              # count this key
     sw   $t3, key_count
-    blt  $t3, 10, redraw          # fewer than 10 keys so far: no new row yet
-    sw   $zero, key_count         # every 10 keys: reset the counter ...
+    lw   $t5, row_interval        # NEW: keys needed per new row (10 in Standard)
+    blt  $t3, $t5, redraw         # CHANGED: fewer keys than the interval so far: no new row yet
+    sw   $zero, key_count         # reached the interval: reset the counter ...
     jal  advance_row              # ... and push a new row in at the top (may end the game)
 
 redraw:
@@ -543,52 +556,62 @@ pause_wait:
 ##############################################################################
 # select_difficulty
 #
-# Displays the difficulty selection menu.
+# Displays the mode selection menu.
 #
-# 1 = Easy   -> 4 starting rows
-# 2 = Medium -> 6 starting rows
-# 3 = Hard   -> 8 starting rows
+# 1 = Standard -> a new row every 10 key presses
+# 2 = Easy     -> a new row every 10 seconds
+# 3 = Medium   -> a new row every 7 seconds
+# 4 = Hard     -> a new row every 5 seconds
 #
-# The player presses 1, 2, or 3 on the keyboard to choose a difficulty.
+# The player presses 1, 2, 3 or 4 on the keyboard to choose.
+# row_mode: 0 = key presses, 1 = seconds.  row_interval: how many of them.
 ##############################################################################
 
 select_difficulty:
     addi $sp, $sp, -4          # Make space on the stack for $ra
     sw   $ra, 0($sp)           # Save return address because we use jal below
     jal  clear_screen          # Erase the previous screen and prepare the menu
-    lw   $s5, white             # Load white into $s5 so menu text is white
-    li   $a0, 16                # Set x-coordinate for the number 1
-    li   $a1, 8                 # Set y-coordinate for the number 1
-    li   $a2, 1                 # Pass digit 1 to draw_digit
-    jal  draw_digit             # Draw the number 1 on the screen
+    lw   $s5, white            # Load white into $s5 so menu text is white
 
-    li   $a0, 22                # Set starting x-coordinate for EASY
-    li   $a1, 8                 # Set y-coordinate for EASY
-    la   $a2, word_easy         # Load address of the EASY font pointer array
-    li   $a3, 4                 # Tell draw_word there are 4 letters
-    jal  draw_word              # Draw EASY on the screen
+    li   $a0, 16               # x of the number 1
+    li   $a1, 4                # y of the first menu row
+    li   $a2, 1                # digit 1
+    jal  draw_digit            # draw "1"
+    li   $a0, 22               # x of the word STANDARD
+    li   $a1, 4                # y of the first menu row
+    la   $a2, word_standard    # font pointer list for STANDARD
+    li   $a3, 8                # 8 letters
+    jal  draw_word             # draw STANDARD
 
-    li   $a0, 16                # Set x-coordinate for the number 2
-    li   $a1, 15                # Set y-coordinate for the number 2
-    li   $a2, 2                 # Pass digit 2 to draw_digit
-    jal  draw_digit             # Draw the number 2 on the screen
+    li   $a0, 16               # x of the number 2
+    li   $a1, 11               # y of the second menu row
+    li   $a2, 2                # digit 2
+    jal  draw_digit            # draw "2"
+    li   $a0, 22               # x of the word EASY
+    li   $a1, 11               # y of the second menu row
+    la   $a2, word_easy        # font pointer list for EASY
+    li   $a3, 4                # 4 letters
+    jal  draw_word             # draw EASY
 
-    li   $a0, 22                # Set starting x-coordinate for MEDIUM
-    li   $a1, 15                # Set y-coordinate for MEDIUM
-    la   $a2, word_medium       # Load address of the MEDIUM font pointer array
-    li   $a3, 6                 # Tell draw_word there are 6 letters
-    jal  draw_word              # Draw MEDIUM on the screen
+    li   $a0, 16               # x of the number 3
+    li   $a1, 18               # y of the third menu row
+    li   $a2, 3                # digit 3
+    jal  draw_digit            # draw "3"
+    li   $a0, 22               # x of the word MEDIUM
+    li   $a1, 18               # y of the third menu row
+    la   $a2, word_medium      # font pointer list for MEDIUM
+    li   $a3, 6                # 6 letters
+    jal  draw_word             # draw MEDIUM
 
-    li   $a0, 16                # Set x-coordinate for the number 3
-    li   $a1, 22                # Set y-coordinate for the number 3
-    li   $a2, 3                 # Pass digit 3 to draw_digit
-    jal  draw_digit             # Draw the number 3 on the screen
-
-    li   $a0, 22                # Set starting x-coordinate for HARD
-    li   $a1, 22                # Set y-coordinate for HARD
-    la   $a2, word_hard         # Load address of the HARD font pointer array
-    li   $a3, 4                 # Tell draw_word there are 4 letters
-    jal  draw_word              # Draw HARD on the screen
+    li   $a0, 16               # x of the number 4
+    li   $a1, 25               # y of the fourth menu row
+    li   $a2, 4                # digit 4
+    jal  draw_digit            # draw "4"
+    li   $a0, 22               # x of the word HARD
+    li   $a1, 25               # y of the fourth menu row
+    la   $a2, word_hard        # font pointer list for HARD
+    li   $a3, 4                # 4 letters
+    jal  draw_word             # draw HARD
 
 difficulty_wait:
     li   $v0, 32                # Select the sleep syscall
@@ -597,31 +620,40 @@ difficulty_wait:
 
     lw   $t0, ADDR_KBRD         # Load address of keyboard input device
     lw   $t1, 0($t0)            # Read keyboard control/status register
-
     bne  $t1, 1, difficulty_wait # If no key is available, keep waiting
-
     lw   $t2, 4($t0)            # Read the actual key that was pressed
 
-    beq  $t2, 0x31, difficulty_easy   # ASCII '1' selects Easy
-    beq  $t2, 0x32, difficulty_medium # ASCII '2' selects Medium
-    beq  $t2, 0x33, difficulty_hard   # ASCII '3' selects Hard
+    beq  $t2, 0x31, difficulty_standard # ASCII '1' selects Standard
+    beq  $t2, 0x32, difficulty_easy     # ASCII '2' selects Easy
+    beq  $t2, 0x33, difficulty_medium   # ASCII '3' selects Medium
+    beq  $t2, 0x34, difficulty_hard     # ASCII '4' selects Hard
+    j    difficulty_wait                # Ignore any other key and keep waiting
 
-    j    difficulty_wait              # Ignore any other key and keep waiting
-
+difficulty_standard:
+    sw   $zero, row_mode        # mode 0: new rows are driven by key presses
+    li   $t0, 10                # every 10 key presses
+    sw   $t0, row_interval
+    j    difficulty_done
 
 difficulty_easy:
-    li   $t0, 4                 # Load 4 into temporary register $t0
-    sw   $t0, fill_rows         # Store 4 into fill_rows
-    j    difficulty_done         # Jump to the end of the selection procedure
+    li   $t0, 1
+    sw   $t0, row_mode          # mode 1: new rows are driven by the timer
+    li   $t0, 10                # every 10 seconds
+    sw   $t0, row_interval
+    j    difficulty_done
 
 difficulty_medium:
-    li   $t0, 6                 # Load 6 into temporary register $t0
-    sw   $t0, fill_rows         # Store 6 into fill_rows
-    j    difficulty_done         # Jump to the end of the selection procedure
+    li   $t0, 1
+    sw   $t0, row_mode          # mode 1: timer
+    li   $t0, 7                 # every 7 seconds
+    sw   $t0, row_interval
+    j    difficulty_done
 
 difficulty_hard:
-    li   $t0, 8                 # Load 8 into temporary register $t0
-    sw   $t0, fill_rows         # Store 8 into fill_rows
+    li   $t0, 1
+    sw   $t0, row_mode          # mode 1: timer
+    li   $t0, 5                 # every 5 seconds
+    sw   $t0, row_interval
 
 difficulty_done:
     lw   $ra, 0($sp)            # Restore the saved return address
@@ -1103,7 +1135,7 @@ resolve_board:
     sw   $s2, 12($sp)
     sw   $s3, 16($sp)
     sw   $s4, 20($sp)
-rb_start:                       # NEW: each pass of the scan (re)starts here
+rb_start:                       # each pass of the scan (re)starts here
     jal  clear_marks            # start with nothing marked for deletion
     li   $s4, 0                 # no trigger found yet
     li   $s1, 0                 # start at column 0
@@ -1150,8 +1182,8 @@ rb_scan_done:
     beqz $s4, rb_finish         # no trigger found: nothing to delete, we are done
     jal  delete_marked          # delete every marked bubble
     jal  apply_gravity          # remaining bubbles (e.g. the G) float up to fill the gaps
-    j    rb_start               # NEW: gravity may have lined up a new run of 3+,
-                                #      so scan the board again (chain reaction)
+    j    rb_start               # gravity may have lined up a new run of 3+,
+                                # so scan the board again (chain reaction)
 rb_finish:
     lw   $ra, 0($sp)            # restore registers and return
     lw   $s0, 4($sp)
@@ -1321,6 +1353,8 @@ as_digit:
 # update_timer: once per real second, subtract 1 from time_left and redraw it.
 # When it reaches 0 print "Time's up!" and go to the game over screen. Uses the system clock, so the
 # countdown speed does not depend on the frame rate.
+# In the timer modes (Easy / Medium / Hard) the same one-second tick also counts
+# up row_secs and pushes a new row every row_interval seconds.
 ##############################################################################
 update_timer:
     addi $sp, $sp, -4           # save $ra
@@ -1337,11 +1371,21 @@ update_timer:
     sw   $t2, time_left
     jal  draw_time              # redraw the LEFT counter
     lw   $t2, time_left         # reload (draw_time changed the temporaries)
-    bgtz $t2, ut_ret            # still time left
+    bgtz $t2, ut_row            # CHANGED: still time left: go and check the row timer
     li   $v0, 4                 # syscall 4 = print string
     la   $a0, timeup_msg        # "Time's up!"
     syscall
     j    game_over              # show the game over screen
+ut_row:                         # NEW: timer modes push a new row every row_interval seconds
+    lw   $t3, row_mode          # NEW: 0 = keystroke mode, 1 = timer mode
+    beqz $t3, ut_ret            # NEW: Standard mode: rows are driven by key presses, not time
+    lw   $t3, row_secs          # NEW: seconds since the last new row
+    addi $t3, $t3, 1            # NEW: one more second has passed
+    sw   $t3, row_secs
+    lw   $t4, row_interval      # NEW: seconds per new row (10 / 7 / 5)
+    blt  $t3, $t4, ut_ret       # NEW: not long enough yet
+    sw   $zero, row_secs        # NEW: restart the row countdown
+    jal  advance_row            # NEW: push a new row in at the top (may end the game)
 ut_ret:
     lw   $ra, 0($sp)            # restore $ra and return
     addi $sp, $sp, 4
@@ -1449,6 +1493,7 @@ rg_vars:
     sw   $zero, held_count      # holding nothing
     sw   $zero, held_colour
     sw   $zero, key_count
+    sw   $zero, row_secs        # NEW: row countdown back to 0
     sw   $zero, score
     li   $t0, 60
     sw   $t0, time_left         # timer back to 60 seconds
